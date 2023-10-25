@@ -1,0 +1,968 @@
+---
+title: "gemma2_tests"
+author: "Jameson Blount"
+date: "2022-12-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+#install.packages("readxl")
+# installing the required libraries 
+library(readxl)
+library(plyr)
+library(tidyverse)
+library(broom)
+library(ggpubr)
+
+#install.packages("factoextra")
+library(factoextra)
+library(gemma2)
+
+setwd("/Users/jamesonblount/gemma2_test/")
+
+```
+
+# GEMMA2 Playground
+
+## Load example data
+```{r Loading example worm data}
+# Genotype Matrix - X
+read_csv("traits.csv", col_names = FALSE) -> geno
+genoI <- geno %>% 
+  filter(grepl("I:",X1)) %>% 
+  filter(!grepl("II:|III:", X1)) # filtering down just to chromosome I
+
+# Phenotype Matrix - Y
+read_tsv("full_traitData.tsv", col_names = TRUE) -> pheno
+
+# Checking the normality of the trait data
+hist(pheno$slope)
+qqnorm(pheno$slope)
+qqline(pheno$slope, col = "red")
+
+# Kinship Matrix - K - also generated using GEMMA
+read_tsv("gemma/grm/gemmeGRM.I.cXX.txt", col_names = FALSE) -> kinshipI 
+
+```
+
+Isolating the genotypes for a single marker, converting that into a matrix
+```{r Formatting matrices}
+g <- genoI[, - c(1:3)]
+g <- distinct(g) # this step is here because I was running into an issue with singular matrices, so this is to assure unique combinations of individuals / genotypes
+t(as.matrix(g)) -> gm 
+
+as.matrix(pheno[ ,2]) -> phe2 # limiting our analysis to just the "slope" trait
+```
+
+Decompose our kinship matrix into eigenvalues and eigenvectors, go ahead and center it:
+```{r Decompose K into eigens}
+e_outI <- eigen2(kinshipI)
+center_kinship(as.matrix(kinshipI)) -> kinshipI_centered
+e_outI <- eigen2(kinshipI_centered)
+```
+
+Read in the residual variance matrix, calculated empirically from the trait data:
+```{r Extract E}
+# Read 
+residvar <- read_tsv("Strain_TotalVar.tsv", col_names = FALSE)
+
+eps_outI <- residvar$X1 
+
+```
+
+Multiply the genotype matrix by the eigenvectors:
+```{r G x eigen}
+kinship_vec <- as.matrix(e_outI$vectors)
+t(gm) %*% kinship_vec -> XU # transformed marker matrix
+```
+
+Call the function MphEM that uses the EM algorithm
+```{r MphEM}
+MphEM(eval = e_outI$values, 
+      X = XU, 
+      Y = t(phe2) %*% e_outI$vectors, 
+      V_g = matrix(c(0.00754107), nrow = 1), # these starting values came from running GEMMA for one iteration
+      V_e = matrix(c(0.00143981), nrow = 1) # need to change the variance components accordingly, properly scale them...test with a 
+      ) -> ground_control
+
+```
+
+```{r calc_qi_mod, calc_xHiy_mod, calc_omega_mod}
+
+calc_qi_mod <- function(eval, eps_eval, D_l, X, V_e_temp){
+  n_size <- length(eval)
+  d_size <- length(D_l)
+  c_size <- nrow(X)
+  # what is c_size? it's the number of rows in the transposed genotypes matrix
+  # transposed genotypes matrix is c by n
+  dc_size <- d_size * c_size
+  Q <- matrix(0, nrow = dc_size, ncol = dc_size)
+  # What is this loop actually calculating?
+  for (i in 1:c_size){
+    for (j in 1:c_size){
+      for (l in 1:d_size){
+        dl <- D_l[l]
+        if (j < i){
+          d <- Q[(j - 1) * d_size + l, (i - 1) * d_size + l]
+        } else {
+          d <- 0
+          for (k in 1:n_size){
+            d1 <- X[i, k]
+            d2 <- X[j, k]
+            delta <- eval[k]
+            epsilon <- eps_eval[k] / V_e_temp[l,l] #resid var from the kth strain scaled by residual variance component
+            
+            d <- d + d1 * d2 / (dl * delta + epsilon)
+          }
+        }
+        Q[(i - 1) * d_size + l, (j - 1) * d_size + l] <- d
+      }
+    }
+  }
+  Qi <- solve(Q)
+  detQ <- det(Q)
+  lndetQ <- log(detQ)
+  return(list(Qi, lndetQ))
+}
+
+calc_XHiY_mod <- function(eval, eps_eval, D_l, X, UltVehiY, V_e_temp){
+  # check inputs
+  D_l <- as.vector(D_l)
+  stopifnot(length(eval) == ncol(X),
+            is.vector(eval),
+            is.vector(D_l))
+  n_size <- length(eval)
+  c_size <- nrow(X)
+  d_size <- length(D_l)
+  xHiy <- rep(0, d_size * c_size)
+  for (i in 1:d_size){
+    dl <- D_l[i]
+    for (j in 1:c_size){
+      d <- 0
+      for (k in 1:n_size){
+        x <- X[j, k]
+        y <- UltVehiY[i, k]
+        delta <- eval[k]
+        epsilon <- eps_eval[k] / V_e_temp
+        d <- d + x * y / (delta * dl + epsilon)
+      }
+      xHiy[(j - 1) * d_size + i] <- d
+    }
+  }
+  return(xHiy)
+}
+
+calc_omega_mod <- function(eval, eps_eval, D_l, V_e_temp){
+  n_size <- length(eval)
+  d_size <- length(D_l)
+  OmegaU <- matrix(nrow = d_size, ncol = n_size)
+  OmegaE <- OmegaU
+  for (k in 1:n_size){
+    delta <- eval[k]
+    epsilon <- eps_eval[k] / V_e_temp
+    for (i in 1:d_size){
+      dl <- D_l[i]
+      d_u <- dl / (delta * dl + epsilon)
+      d_e <- d_u * delta
+      OmegaU[i, k] <- d_u
+      OmegaE[i, k] <- d_e
+    }
+  }
+  return(list(OmegaU, OmegaE))
+}
+
+```
+
+``` {MphCalcLogL_mod, and eigen_proc}
+MphCalcLogL_mod <- function(eval, eps_eval, V_e_temp, D_l, Qi, UltVehiY, xHiy){
+  n_size <- length(eval)
+  d_size <- length(D_l) # d is number of phenotypes
+  dc_size <- nrow(Qi)
+  logl <- 0
+  for (k in 1:n_size){
+    delta <- eval[k]
+    epsilon <- eps_eval[k] / V_e_temp
+    for (i in 1:d_size){
+      y <- UltVehiY[i, k]
+      dl <- D_l[i]
+      d <- delta * dl + epsilon
+      logl <- logl + y^2 / d + log(d)
+    }
+  }
+  Qiv <- Qi %*% xHiy
+  d <- t(xHiy) %*% Qiv
+  stopifnot(length(d) == 1)
+  logl <- logl - d
+  return(- 0.5 * logl)
+}
+
+#' Eigendecomposition procedure for Vg and Ve
+#'
+#' @param V_g a d_size by d_size covariance matrix
+#' @param V_e a d_size by d_size covariance matrix
+#' @param tol a positive number indicating the tolerance for isSymmetric
+#' @export
+#' @return a named list of length 4 containing the outputs of eigendecomposition procedure
+#' @examples
+#' eigen_proc(diag(2), diag(2))
+#'
+eigen_proc_mod <- function(V_g, V_e, tol = 1 / 10000){
+  # check inputs
+  stopifnot(isSymmetric(V_g, tol = tol), isSymmetric(V_e, tol = tol))
+  d_size <- nrow(V_g)
+  logdet_Ve <- 0
+  Lambda <- matrix(nrow = d_size, ncol = d_size)
+  V_e_temp <- matrix(nrow = d_size, ncol = d_size)
+  V_e_h <- matrix(0, nrow = d_size, ncol = d_size)
+  V_e_hi <- matrix(0, nrow = d_size, ncol = d_size)
+  VgVehi <- matrix(nrow = d_size, ncol = d_size)
+  U_l <- matrix(nrow = d_size, ncol = d_size)
+  V_e -> V_e_temp
+  eigen2(V_e_temp) -> eout
+  eout$values -> D_l
+  eout$vectors -> U_l
+  if (length(U_l == 1)) U_l <- as.matrix(U_l)
+  for (i in 1:d_size){
+    d <- D_l[i]
+    if (d > 0){
+      logdet_Ve <- logdet_Ve + log(d)
+      U_col <- U_l[, i]
+      d <- sqrt(d)
+      V_e_h <- V_e_h + d * U_col %*% t(U_col)
+      V_e_hi <- V_e_hi + U_col %*% t(U_col) / d
+    }
+  }
+  V_g %*% V_e_hi -> VgVehi
+  Lambda <- V_e_hi %*% VgVehi
+
+  eigen2(Lambda) -> eout
+  eout$values -> D_l
+  eout$vectors -> U_l
+  if (length(U_l) == 1) U_l <- as.matrix(U_l)
+  D_l[D_l < 0] <- 0
+  UltVeh <- t(U_l) %*% V_e_h
+  UltVehi <- t(U_l) %*% V_e_hi
+
+  return(list(logdet_Ve = logdet_Ve, UltVeh = UltVeh, UltVehi = UltVehi, D_l = D_l, V_e_temp = V_e_temp ))
+}
+
+```
+
+``` {update_u_mod, update_v_mod, etc}
+#' Update U matrix
+#'
+#' @param OmegaE the OmegaE matrix, calculated in calc_omega
+#' @param UltVehiY matrix
+#' @param UltVehiBX matrix
+#' @family expectation-maximization functions
+#' @export
+#' @examples
+#' readr::read_tsv(system.file("extdata",
+#' "mouse100.pheno.txt",
+#' package = "gemma2"),
+#' col_names = FALSE) -> pheno
+#' phe16 <- as.matrix(pheno[, c(1, 6)])
+#' as.matrix(readr::read_tsv(system.file("extdata",
+#' "mouse100.cXX.txt",
+#' package = "gemma2"),
+#' col_names = FALSE)[, 1:100]) -> kinship
+#' eigen2(kinship) -> e2_out
+#' e2_out$values -> eval
+#' e2_out$vectors -> U
+#' eigen_proc(V_g = diag(c(1.91352, 0.530827)),
+#' V_e = diag(c(0.320028, 0.561589))) -> ep_out
+#' UltVehi <- ep_out[[3]]
+#' calc_omega(eval, ep_out$D_l) -> co_out
+#' update_u(OmegaE = co_out[[2]],
+#'         UltVehiY = UltVehi %*% t(phe16),
+#'         UltVehiBX = matrix(c(-0.71342, -0.824482),
+#'         ncol = 1) %*% t(rep(1, 100))
+#' )
+update_u_mod <- function(OmegaE, UltVehiY, UltVehiBX){
+  UltVehiU <- UltVehiY
+  UltVehiU <- UltVehiU - UltVehiBX
+  UltVehiU <- UltVehiU * OmegaE
+  return(UltVehiU)
+}
+
+#' Update E
+#'
+#' @param UltVehiY matrix of transformed Y values
+#' @param UltVehiBX matrix of transformed BX values
+#' @param UltVehiU matrix of transformed U values
+#' @family expectation-maximization functions
+update_e_mod <- function(UltVehiY, UltVehiBX, UltVehiU){
+  UltVehiE <- UltVehiY - UltVehiBX - UltVehiU
+  return(UltVehiE)
+}
+
+#' Update B for restricted log likelihood
+#'
+#' @param xHiy vector
+#' @param Qi Q inverse matrix
+#' @param d_size number of traits
+#' @family expectation-maximization functions
+UpdateRL_B_mod <- function(xHiy, Qi, d_size){
+  nrow(Qi) -> dc_size
+  c_size <- dc_size / d_size
+  b <- Qi %*% xHiy
+  UltVehiB <- matrix(nrow = d_size, ncol = c_size)
+  for (i in 1:c_size){
+    b_subcol <- b[(1 + (i - 1) * d_size):(i * d_size)]
+    b_subcol -> UltVehiB[, i] # could use as.matrix here
+  }
+  return(UltVehiB)
+}
+
+#' Update V_e and V_g
+#'
+#' @param eval vector of eigenvalues from eigendecomposition of relatedness matrix
+#' @param U matrix
+#' @param E matrix
+#' @param Sigma_uu matrix
+#' @param Sigma_ee matrix
+#' @param tol a positive number indicating tolerance to be passed to isSymmetric()
+#' @family expectation-maximization functions
+update_v_mod <- function(eval, eps_eval, V_e_temp, U, E, Sigma_uu, Sigma_ee, tol = 1 / 10000){
+  stopifnot(isSymmetric(Sigma_uu, tol = tol), isSymmetric(Sigma_ee, tol = tol))
+  n_size <- length(eval)
+  d_size <- nrow(U)
+  V_g <- matrix(0, nrow = d_size, ncol = d_size)
+  V_e <- V_g
+  for (k in 1:n_size){
+    delta <- eval[k]
+    epsilon <- eps_eval[k] / V_e_temp
+    #if (delta != 0){
+      U_col <- U[, k]
+      E_col <- E[, k]
+      V_g <- V_g + U_col %*% t(U_col) / delta
+      V_e <- V_e + E_col %*% t(E_col) / epsilon
+    #}
+  }
+  V_g <- V_g + Sigma_uu
+  V_e <- V_e + Sigma_ee
+  V_g <- V_g / n_size
+  V_e <- V_e / n_size
+  return(list(V_g, V_e))
+}
+
+#' Calculate Sigma_ee and Sigma_uu matrices
+#'
+#' @param eval eigenvalues vector from decomposition of relatedness matrix
+#' @param D_l vector
+#' @param X design matrix
+#' @param OmegaU matrix
+#' @param OmegaE matrix
+#' @param UltVeh matrix
+#' @param Qi inverse of Q matrix
+calc_sigma_mod <- function(eval, eps_eval, D_l, X, V_e_temp, OmegaU, OmegaE, UltVeh, Qi){
+  n_size <- length(eval)
+  c_size <- nrow(X)
+  d_size <- length(D_l)
+  dc_size <- nrow(Qi)
+  Sigma_ee <- matrix(0, nrow = d_size, ncol = d_size)
+  Sigma_uu <- Sigma_ee
+  for (k in 1:n_size){
+    OmegaU_col <- OmegaU[, k]
+    OmegaE_col <- OmegaE[, k]
+    diag(Sigma_uu) <- diag(Sigma_uu) + OmegaU_col
+    diag(Sigma_ee) <- diag(Sigma_ee) + OmegaE_col
+  }
+  M_u <- matrix(0, nrow = dc_size, ncol = d_size)
+  M_e <- M_u
+  for (k in 1:n_size){
+    delta <- eval[k]
+    epsilon <- eps_eval[k] / V_e_temp
+    for (i in 1:d_size){
+      dl <- D_l[i]
+      for (j in 1:c_size){
+        x <- X[j, k]
+        d <- x / (delta * dl + epsilon)
+        M_e[(j - 1) * d_size + i, i] <- d
+        M_u[(j - 1) * d_size + i, i] <- d * dl
+      }
+    }
+    QiM <- Qi %*% M_u
+    Sigma_uu <- Sigma_uu + t(M_u) %*% QiM * delta
+    QiM <- Qi %*% M_e
+    Sigma_ee <- Sigma_ee + t(M_e) %*% QiM * epsilon
+  } # end loop in k
+  M <- Sigma_uu %*% UltVeh
+  Sigma_uu <- t(UltVeh) %*% M
+  M <- Sigma_ee %*% UltVeh
+  Sigma_ee <- t(UltVeh) %*% M
+  return(list(Sigma_ee, Sigma_uu))
+}
+
+
+```
+
+Now I need to turn everything into the working function:
+```{r MphEMmod}
+MphEMmod <- function(max_iter = 10000, max_prec = 1/1e+06,
+                  eval, eps_eval, X, Y, V_g, V_e,
+                  verbose_output = FALSE){
+  n_size <- length(eval)
+  # be careful with defining c_size here
+
+  c_size <- nrow(X)
+  d_size <- nrow(Y)
+  dc_size <- c_size * d_size
+  # calculate XXt and XXti
+  XXt <- X %*% t(X)
+  logl_const <- -(n_size - c_size) * d_size * log(2 * pi)/2 + d_size * log(det(XXt))/2
+  #}
+  out <- list()
+  #logl_old <- 1 # we need to define logl_old before using it within the EM iterations
+  # start EM
+  for (t in 1:max_iter){
+    # eigen_proc
+    ep_out <- eigen_proc_mod(V_g, V_e)
+    ep_out[[1]] -> logdet_Ve
+    ep_out[[2]] -> UltVeh
+    ep_out[[3]] -> UltVehi
+    ep_out[[4]] -> D_l
+    ep_out[[5]] -> V_e_temp
+    # calc_qi
+    cq_out <- calc_qi_mod(eval, eps_eval, D_l, X, V_e_temp)
+    cq_out[[1]] -> Qi
+    cq_out[[2]] -> lndetQ
+    
+    UltVehiY <- UltVehi %*% Y
+    xHiy <- calc_XHiY_mod(eval = eval, eps_eval = eps_eval, D_l = D_l, X = X, UltVehiY = UltVehiY, V_e_temp = V_e_temp)
+    
+    logl_new_mod <- logl_const + MphCalcLogL_mod(eval = eval, eps_eval = eps_eval, V_e_temp = V_e_temp,
+                                                 xHiy = xHiy,
+                                         D_l = D_l, UltVehiY = UltVehiY,
+                                         Qi = Qi) - 0.5 * n_size * logdet_Ve
+    #if (func_name=='R') {
+    logl_new_mod <- logl_new_mod - 0.5 * (lndetQ - c_size * logdet_Ve)
+    #}
+    if (t > 1){
+      if (logl_new_mod - logl_old_mod < max_prec){break}
+    }
+    #if (t > 1 & abs(logl_new - logl_old) < max_prec) {break}
+    logl_old_mod <- logl_new_mod
+    co_out <- calc_omega_mod(eval, eps_eval, D_l, V_e_temp)
+    co_out[[1]] -> OmegaU
+    co_out[[2]] -> OmegaE
+    UltVehiB <- UpdateRL_B_mod(xHiy, Qi, d_size = nrow(Y))
+    UltVehiBX <- UltVehiB %*% X
+
+    UltVehiU <- update_u_mod(OmegaE, UltVehiY, UltVehiBX)
+    UltVehiE <- update_e_mod(UltVehiY, UltVehiBX, UltVehiU)
+    U_hat <- t(UltVeh) %*% UltVehiU
+    E_hat <- t(UltVeh) %*% UltVehiE
+    B <- t(UltVeh) %*% UltVehiB
+    cs_out <- calc_sigma_mod(eval = eval, eps_eval = eps_eval, D_l = D_l,
+                         X = X, V_e_temp = V_e_temp, OmegaU = OmegaU, OmegaE = OmegaE,
+                         UltVeh = UltVeh, Qi = Qi)
+    cs_out[[1]] -> Sigma_ee
+    cs_out[[2]] -> Sigma_uu
+    uv_out <- update_v_mod(eval, eps_eval, V_e_temp, U_hat, E_hat, Sigma_uu, Sigma_ee)
+    # update V_g and V_e
+    uv_out[[1]] -> V_g
+    uv_out[[2]] -> V_e
+    if (verbose_output) {
+      out[[t]] <- list(logl_new_mod = logl_new_mod, Vg = V_g, Ve = V_e, Sigma_uu = Sigma_uu,
+                     Sigma_ee = Sigma_ee, B = B,
+                     U_hat = U_hat, E_hat = E_hat,
+                     OmegaU = OmegaU, OmegaE = OmegaE, logdet_Ve = logdet_Ve,
+                     UltVeh = UltVeh, UltVehi = UltVehi,
+                     Dl = D_l, xHiy = xHiy, logl_const = logl_const, UltVehiU = UltVehiU
+                     )
+    } else {
+      out[[1]] <- list(logl_new_mod = logl_new_mod, Vg = V_g, Ve = V_e, Sigma_uu = Sigma_uu,
+                       Sigma_ee = Sigma_ee, B = B,
+                       U_hat = U_hat, E_hat = E_hat,
+                       OmegaU = OmegaU, OmegaE = OmegaE, logdet_Ve = logdet_Ve,
+                       UltVeh = UltVeh, UltVehi = UltVehi,
+                       Dl = D_l, xHiy = xHiy, logl_const = logl_const, UltVehiU = UltVehiU
+      )
+    }
+  }
+  if (length(out) == max_iter){warning("EM algorithm didn't converge.")}
+  return(out)
+}
+
+
+```
+
+``` {Testing Finalized Function}
+# Actually need to scale the residual variance values by the residual variance component
+
+#e_out is eigendecomp of kinship
+MphEMmod(eval = e_outI$values, # In the original math, these are Dk, the eigenvalues from the decomposition of the kinship matrix, where k is the strain
+      eps_eval = eps_outI,
+      X = XU, 
+      Y = t(phe2) %*% e_outI$vectors, 
+      V_g = matrix(c(0.00754107), nrow = 1), # these starting values came from running GEMMA for one iteration
+      V_e = matrix(c(0.00143981), nrow = 1)) -> modEM_test # test fails, does not return to control
+
+MphEM(eval = e_outI$values, # In the original math, these are Dk, the eigenvalues from the decomposition of the kinship matrix, where k is the strain
+      X = XU, 
+      Y = t(phe2) %*% e_outI$vectors, 
+      V_g = matrix(c(0.00754107), nrow = 1), # these starting values came from running GEMMA for one iteration
+      V_e = matrix(c(0.00143981), nrow = 1)) -> controlEM
+
+controlEM[[1]]$Vg
+modEM_test[[1]]$Vg
+
+# These quantities still don't match, maybe it's because my modded ver is only running one iteration? It certainly moves slower than the vanilla version
+
+#e_out is eigendecomp of kinship
+MphEMmod(eval = e_outI$values, # In the original math, these are Dk, the eigenvalues from the decomposition of the kinship matrix, where k is the strain
+      eps_eval = eps_outI,
+      X = X5U, 
+      Y = t(phe2) %*% e_outI$vectors, 
+      V_g = matrix(c(0.00754107), nrow = 1), # these starting values came from running GEMMA for one iteration
+      V_e = matrix(c(0.00143981), nrow = 1)) -> modEM # increases V_g by a factor of 1000
+
+# For generating p-values
+# Need to calculate the transformed covariance matrix W
+# It's actaully the transformed covariATE matrix, which is basically just the 
+# eigen vector U times a column vector of 1s
+W <- matrix(1, nrow = length(phe2))
+t(W) %*% e_outI$vectors -> UtW
+ 
+control_eps <- rep(controlEM[[1]]$Ve, 100)
+
+MphCalcP(eval = e_outI$values,
+         eps_eval = control_eps,
+         X_vec = X5U[1,],
+         W = UtW,
+         Y = t(phe2) %*% e_outI$vectors, 
+         V_g = controlEM[[1]]$Vg, # these starting values came from running GEMMA for one iteration
+         V_e = controlEM[[1]]$Ve) -> controlEM_pvals # the control doesn't match the original results from vanilla GEMMA
+# but that's also not an equivalent comparision since you only ran it on 5 SNPs, so maybe with all of them 
+# it would be different?
+
+```
+
+``` {r Calculate p-values, beta (d by 1 vector) and V(beta)}
+# Translated from c++ on line 727
+# W is a c by n matrix of covariates (so for us its just a row of 1s as intercept)
+# This makes A a 1 by 1 matrix of just the intercept....
+library(Matrix)
+MphCalcP <- function(eval, eps_eval, X_vec, W, Y, V_g, V_e) {
+  n_size <- length(eval)
+  c_size <- nrow(W)
+  d_size <- nrow(V_g)
+  dc_size <- d_size * c_size
+  
+  WHix <- matrix(0, nrow = dc_size, ncol = d_size) # dc x d matrix
+  QiWHix <- matrix(0, nrow = dc_size, ncol = d_size) # dc x d matrix
+  xPx <- matrix(0, nrow = d_size, ncol = d_size) # d x d matrix
+  xPy <- matrix(0, nrow = d_size, ncol = 1) # d vector
+  WHiy <- matrix(0, nrow = dc_size, ncol = 1) # dc vector
+  
+  # eigen_proc
+    ep_out <- eigen_proc_mod(V_g, V_e)
+    ep_out[[1]] -> logdet_Ve # just a quantity
+    ep_out[[2]] -> UltVeh # d x d matrix 
+    ep_out[[3]] -> UltVehi # d x d matrix
+    ep_out[[4]] -> D_l # d vector
+    ep_out[[5]] -> V_e_temp # d x d matrix
+    # calc_qi
+    cq_out <- calc_qi_mod(eval, eps_eval, D_l, W, V_e_temp)
+    cq_out[[1]] -> Qi
+    cq_out[[2]] -> lndetQ
+    
+    # Calculate UltVehiY
+    UltVehiY <- UltVehi %*% Y
+    
+    # Calculate WHix, WHiy, xHiy, xHix
+    for (i in 1:d_size){
+      dl <- D_l[i]
+      
+      d1 = 0
+      d2 = 0
+    
+      for (k in 1:n_size){
+        dx <- X_vec[k]
+        dy <- UltVehiY[i, k]
+        delta <- eval[k]
+        epsilon <- eps_eval[k] / V_e_temp
+        
+        d1 <- d1 + dx * dy / (delta * dl + epsilon)
+        d2 <- d2 + dx * dx / (delta * dl + epsilon)
+      }
+      xPy[i] <- d1
+      xPx[i,i] <- d2
+  
+      for (j in 1:c_size) {
+        d1 = 0
+        d2 = 0
+        for (k in 1:n_size) {
+          delta <- eval[k]
+          epsilon <- eps_eval[k] / V_e_temp
+          dx <- X_vec[k]
+          dw <- W[j,k]
+          dy <- UltVehiY[i,k]
+          
+          d1 <- d1 + dx * dw / (delta * dl + epsilon);
+          d2 <- d2 + dy * dw / (delta * dl + epsilon);
+        }
+        WHix[i, i] <- d1
+        WHiy[i] <- d2
+      }
+    }
+  QiWHix <- Qi %*% WHix
+  xPx <- WHix %*% QiWHix
+  xPy <- QiWHix %*% WHiy
+  
+  # Calculate V(beta) and beta
+  # LU decomposition
+  lu_decomp <- lu(xPx)
+  
+  # Solve linear system
+  D_l <- solve(lu_decomp@x, xPy)
+
+  # Compute matrix inverse
+  Vbeta <- solve(xPx)
+  
+  # Need to multiply UltVehi on both sides or one side
+  # Matrix multiplication
+  beta <- t(UltVeh) %*% D_l
+  xPx <- Vbeta %*% UltVeh
+  Vbeta <- t(UltVeh) %*% xPx
+
+  # Dot product to calculate test statistic and pvalue
+  d <- sum(D_l * xPy)
+  
+  #p-value from test statistic
+  p_value <- 1 - pchisq(d, d_size)
+  
+  return(p_value)
+}
+
+# Calculate B and its standard error (a matrix of the same dimension as B)
+MphCalcBeta <- function(eval, eps_eval, W, Y, V_g, V_e, UltVehiY) {
+  n_size <- length(eval)
+  c_size <- nrow(W)
+  d_size <- nrow(V_g)
+  dc_size <- d_size * c_size
+  
+  Qi_temp <- matrix(0, nrow = dc_size, ncol = dc_size) # dc x dc matrix
+  WHiy <- matrix(0, nrow = dc_size, ncol = 1) # dc vector
+  QiWHiy <- matrix(0, nrow = dc_size, ncol = 1) # dc vector
+  beta <- matrix(0, nrow = dc_size, ncol = 1) # dc vector
+  Vbeta <- matrix(0, nrow = dc_size, ncol = dc_size) # dc vector
+  
+  # eigen_proc
+    ep_out <- eigen_proc_mod(V_g, V_e)
+    ep_out[[1]] -> logdet_Ve # just a quantity
+    ep_out[[2]] -> UltVeh # d x d matrix 
+    ep_out[[3]] -> UltVehi # d x d matrix
+    ep_out[[4]] -> D_l # d vector
+    ep_out[[5]] -> V_e_temp # d x d matrix
+    # calc_qi
+    cq_out <- calc_qi_mod(eval, eps_eval, D_l, X, V_e_temp)
+    cq_out[[1]] -> Qi # dc x dc matrix
+    cq_out[[2]] -> lndetQ
+    
+    # Calculate UltVehiY
+    UltVehiY <- UltVehi %*% Y
+    
+    # Calculate WHiY
+    for (i in 1:d_size) {
+      dl <- D_l[i]
+      for (j in 1:c_size) {
+        d <- 0
+        for (k in 1:n_size) {
+          delta <- eval[k]
+          epsilon <- eps_eval[k] / V_e_temp
+          dw <- W[j,k]
+          dy <- UltVehiY[i,k]
+          
+          d <- d + ((dy + dw) / (delta * dl + epsilon))
+        
+        }
+        WHiY[i] <- d 
+      }
+    }
+    QiWHiy <- Qi %*% WHiy
+    
+    ## Need to multiply I_c\otimes UltVehi on both sides or one side.
+    for (i in 1:c_size) {
+      QiWHiy_sub <- QiWHiy[(i - 1) * d_size + 1 : (i * d_size)]
+      beta_sub <- beta[(i - 1) * d_size + 1 : (i * d_size)]
+      beta_sub <- t(UltVeh) %*% QiWHiy_sub
+      for (j in 1:c_size) {
+        Qi_sub <- Qi[(i - 1) * d_size + 1 : (i * d_size), (j - 1) * d_size + 1 : (j * d_size)]
+        Qitemp_sub <- Qi_temp[(i - 1) * d_size + 1 : (i * d_size), (j - 1) * d_size + 1 : (j * d_size)]
+        Vbeta_sub <- Vbeta[(i - 1) * d_size + 1 : (i * d_size), (j - 1) * d_size + 1 : (j * d_size)]
+    
+        if (j < i) {
+          Vbeta_sym <- Vbeta[(j - 1) * d_size + 1 : (j * d_size), (i - 1) * d_size + 1 : (i * d_size)]
+          Vbeta_sub <- t(Vbeta_sym)
+        } else {
+          Qitemp_sub <- Qi_sub %*% UltVeh
+          Vbeta_sub <- t(UltVeh) %*% Qitemp_sub
+        }
+      }
+    }
+    
+    # Loop through columns of B and se_B
+    for (j in 1:ncol(B)) {
+      # Loop through rows of B and se_B
+      for (i in 1:nrow(B)) {
+        # Set elements of B and se_B
+        B[i, j] <- gsl_vector_get(beta, (j - 1) * d_size + i)
+        se_B[i, j] <- sqrt(gsl_matrix_get(Vbeta, (j - 1) * d_size + i,
+                                      (j - 1) * d_size + i))
+        }
+    }
+    return(B,se_B)
+}
+
+
+```
+
+The output of MphEM is a list of lists, where there is one list for every iteration of the EM algorithm. 
+
+Below this line is where I did my scratch work, testing everything line-by-line to make sure everything met my expectations
+```{r Examining line-by-line MpEM}
+#e_out is eigendecomp of kinship
+max_iter <- 10000
+eval <- e_outI$values # In the original math, these are Dk, the eigenvalues from the decomposition of the kinship matrix, where k is the strain
+eps_eval <- iden # these will be e, where k is the strain
+X <- X5U
+Y <- t(phe2) %*% e_outI$vectors
+V_g <- matrix(c(1.91352), nrow = 1)
+V_e <- matrix(c(0.320028), nrow = 1)
+#H <- diag(eval) * as.double(V_g) + diag(sig_eval) * as.double(V_e)
+
+n_size <- length(eval) # number of strains
+c_size <- nrow(X) # number of SNPs
+d_size <- nrow(Y) # number of phenotypes
+dc_size <- c_size * d_size 
+
+XXt <- X %*% t(X)
+logl_const <- -(n_size - c_size -1) * d_size * log(2 * pi)/2 + d_size * log(det(XXt))/2
+
+## eigen_proc
+  d_size <- nrow(V_g)
+  logdet_Ve <- 0
+  Lambda <- matrix(nrow = d_size, ncol = d_size)
+  V_e_temp <- matrix(nrow = d_size, ncol = d_size)
+  V_e_h <- matrix(0, nrow = d_size, ncol = d_size)
+  V_e_hi <- matrix(0, nrow = d_size, ncol = d_size)
+  VgVehi <- matrix(nrow = d_size, ncol = d_size)
+  U_l <- matrix(nrow = d_size, ncol = d_size)
+  V_e -> V_e_temp
+  eigen2(V_e_temp) -> eout
+  eout$values -> D_l # 0.320028 (the eigenvalue of Ve, residual variance comp)
+  eout$vectors -> U_l # 1
+  if (length(U_l == 1)) U_l <- as.matrix(U_l)
+  for (i in 1:d_size){
+    d <- D_l[i]
+    if (d > 0){
+      logdet_Ve <- logdet_Ve + log(d)
+      U_col <- U_l[, i]
+      d <- sqrt(d)
+      V_e_h <- V_e_h + d * U_col %*% t(U_col) # 0.566
+      V_e_hi <- V_e_hi + U_col %*% t(U_col) / d #1.77
+    }
+  }
+  V_g %*% V_e_hi -> VgVehi #3.38
+  Lambda <- V_e_hi %*% VgVehi #5.98
+  # Lambda represents the canonical transformation 
+
+  eigen2(Lambda) -> eout # eigendecomp of V_e_hi %*% V_g %*% V_e_hi 
+  # = 1/sqrt(Ve) * Vg * 1/sqrt(Ve)
+  eout$values -> D_l # 5.98
+  eout$vectors -> U_l # 1
+  if (length(U_l) == 1) U_l <- as.matrix(U_l)
+  D_l[D_l < 0] <- 0
+  UltVeh <- t(U_l) %*% V_e_h # UlT %*% V_e_h = 0.566
+  UltVehi <- t(U_l) %*% V_e_hi # UlT %*% V_e_hi = 1.77
+
+# calc_qi
+  n_size <- length(eval)
+  d_size <- length(D_l) # D_l = 5.98, U_l = 1
+  c_size <- nrow(X)# what is c_size? it's the number of rows in the transposed genotypes matrix
+  # transposed genotypes matrix is c by n
+  dc_size <- d_size * c_size
+  Q <- matrix(0, nrow = dc_size, ncol = dc_size)
+  # sum x * xt / V_l , V_l = (D_lambda)
+  # What is this loop actually calculating?
+  for (i in 1:c_size){
+    for (j in 1:c_size){
+      for (l in 1:d_size){
+        dl <- D_l[l] # the eigen decomp of lambda
+        if (j < i){
+          d <- Q[(j - 1) * d_size + l, (i - 1) * d_size + l]
+        } else {
+          d <- 0
+          for (k in 1:n_size){
+            d1 <- X[i, k] # d1 <- ith SNP, kth strain
+            d2 <- X[j, k] # d2 <- jth SNP, kth strain
+            delta <- eval[k] # the eigenvalue from the eigen decomp of kinship from                                 the kth strain
+            epsilon <- eps_eval[k] / V_e_temp # the eigenvalue from eigen decomp of resid var                                  from the kth strain
+            
+            d <- d + d1 * d2 / (dl * delta + epsilon) # the denominator is H
+          }
+        }
+        Q[(i -1) * d_size + l, (j - 1) * d_size + l] <- d # numbers are getting big
+          # because instead of basically dividing by 1, we're now dividing by a very small number instead of 1, the residual variance is dominating here
+      }
+    }
+  }
+  Qi <- solve(Q)
+  detQ <- det(Q)
+  lndetQ <- log(detQ)
+
+UltVehiY <- UltVehi %*% Y
+  
+# calc_XHiY
+  n_size <- length(eval)
+  c_size <- nrow(X)
+  d_size <- length(D_l)
+  xHiy <- rep(0, d_size * c_size)
+  for (i in 1:d_size){
+    dl <- D_l[i]
+    for (j in 1:c_size){
+      d <- 0
+      for (k in 1:n_size){
+        x <- X[j, k]
+        y <- UltVehiY[i, k]
+        delta <- eval[k]
+        epsilon <- eps_eval[k] / V_e_temp# the eigenvalue from eigen decomp of resid var                                  from the kth strain
+        h <- H[k,k]
+        d <- d + x * y / (dl * delta + epsilon) # the denominator is H
+      }
+      xHiy[(j - 1) * d_size + i] <- d
+    }
+  }
+  
+# Mph CalcLogL(eval, sig_eval, xHiy, D_l, UltVehi, Qi)
+  n_size <- length(eval)
+  d_size <- length(D_l) # d is number of phenotypes
+  dc_size <- nrow(Qi)
+  logl <- 0
+  for (k in 1:n_size){
+    delta <- eval[k]
+    epsilon <- eps_eval[k] / V_e_temp
+    for (i in 1:d_size){
+      y <- UltVehiY[i, k]
+      dl <- D_l[i]
+      d <- (dl * delta + epsilon)
+      logl <- logl + y^2 / d + log(d)
+    }
+  }
+  Qiv <- Qi %*% xHiy
+  d <- t(xHiy) %*% Qiv
+  stopifnot(length(d) == 1)
+  logl <- logl - d
+  MphCalcLogL_edit <- (- 0.5 * logl)
+  
+logl_new <- logl_const + MphCalcLogL_edit - 0.5 * n_size * logdet_Ve
+logl_new <- logl_new - 0.5 * (lndetQ - c_size * logdet_Ve)
+logl_old <- logl_new
+
+# calc_omega(eval, sig_eval, D_l)
+  n_size <- length(eval)
+  d_size <- length(D_l)
+  OmegaU <- matrix(nrow = d_size, ncol = n_size)
+  OmegaE <- OmegaU
+  for (k in 1:n_size){
+    delta <- eval[k]
+    epsilon <- eps_eval[k] / V_e_temp
+    h <- H[k,k]
+    for (i in 1:d_size){
+      dl <- D_l[i]
+      d_u <- dl / (dl * delta + epsilon)
+      d_e <- delta * d_u
+      OmegaU[i, k] <- d_u
+      OmegaE[i, k] <- d_e
+    }
+  }
+  
+# UpdateRL_b(xHiy, Qi, d_size = nrow(Y))
+  d_size <- nrow(Y)
+  nrow(Qi) -> dc_size
+  c_size <- dc_size / d_size
+  b <- Qi %*% xHiy
+  UltVehiB <- matrix(nrow = d_size, ncol = c_size)
+  for (i in 1:c_size){
+    b_subcol <- b[(1 + (i - 1) * d_size):(i * d_size)]
+    b_subcol -> UltVehiB[, i] # could use as.matrix here
+  }
+  
+UltVehiBX <- UltVehiB %*% X
+
+# update_u
+UltVehiU <- UltVehiY
+  UltVehiU <- UltVehiU - UltVehiBX
+  UltVehiU <- UltVehiU * OmegaE
+
+# update_e
+  UltVehiE <- UltVehiY - UltVehiBX - UltVehiU
+  
+U_hat <- t(UltVeh) %*% UltVehiU
+E_hat <- t(UltVeh) %*% UltVehiE
+B <- t(UltVeh) %*% UltVehiB
+
+# calc_epsilon
+  n_size <- length(eval)
+  c_size <- nrow(X)
+  d_size <- length(D_l)
+  dc_size <- nrow(Qi)
+  epsilon_ee <- matrix(0, nrow = d_size, ncol = d_size)
+  epsilon_uu <- epsilon_ee
+  for (k in 1:n_size){
+    OmegaU_col <- OmegaU[, k]
+    OmegaE_col <- OmegaE[, k]
+    diag(epsilon_uu) <- diag(epsilon_uu) + OmegaU_col
+    diag(epsilon_ee) <- diag(epsilon_ee) + OmegaE_col
+  }
+  M_u <- matrix(0, nrow = dc_size, ncol = d_size)
+  M_e <- M_u
+  for (k in 1:n_size){
+    delta <- eval[k]
+    epsilon <- eps_eval[k] / V_e_temp
+    h <- H[k,k]
+    for (i in 1:d_size){
+      dl <- D_l[i]
+      for (j in 1:c_size){
+        x <- X[j, k]
+        d <- x / (dl * delta + epsilon)
+        M_e[(j - 1) * d_size + i, i] <- d
+        M_u[(j - 1) * d_size + i, i] <- d * dl
+      }
+    }
+    QiM <- Qi %*% M_u
+    epsilon_uu <- epsilon_uu + t(M_u) %*% QiM * delta
+    QiM <- Qi %*% M_e
+    epsilon_ee <- epsilon_ee + t(M_e) %*% QiM * epsilon
+  } # end loop in k
+  M <- epsilon_uu %*% UltVeh
+  epsilon_uu <- t(UltVeh) %*% M
+  M <- epsilon_ee %*% UltVeh
+  epsilon_ee <- t(UltVeh) %*% M
+  
+# update_v
+  n_size <- length(eval)
+  d_size <- nrow(U_l)
+  V_g <- matrix(0, nrow = d_size, ncol = d_size)
+  V_e <- V_g
+  for (k in 1:n_size){
+    delta <- eval[k]
+    epsilon <- eps_eval[k] / V_e_temp
+    #if (delta != 0){
+      U_col <- U_hat[, k]
+      E_col <- E_hat[, k] # THIS WAS THE PROBLEM 
+      V_g <- V_g + U_col %*% t(U_col) / delta
+      V_e <- V_e + E_col %*% t(E_col) / epsilon
+    #}
+  }
+  
+  V_g <- V_g + epsilon_uu
+  V_e <- V_e + epsilon_ee
+  V_g <- V_g / n_size
+  V_e <- V_e / n_size
+```
+
