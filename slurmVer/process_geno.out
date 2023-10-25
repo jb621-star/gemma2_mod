@@ -1,0 +1,79 @@
+running
+  '/opt/apps/rhel8/R-4.1.1/lib64/R/bin/R --no-echo --no-restore --vanilla --file=gemma_2_chrI.R'
+
+── Attaching packages ─────────────────────────────────────── tidyverse 1.3.1 ──
+✔ ggplot2 3.4.2     ✔ purrr   1.0.1
+✔ tibble  3.2.1     ✔ dplyr   1.1.1
+✔ tidyr   1.3.0     ✔ stringr 1.5.0
+✔ readr   2.1.4     ✔ forcats 1.0.0
+── Conflicts ────────────────────────────────────────── tidyverse_conflicts() ──
+✖ dplyr::arrange()   masks plyr::arrange()
+✖ purrr::compact()   masks plyr::compact()
+✖ dplyr::count()     masks plyr::count()
+✖ dplyr::desc()      masks plyr::desc()
+✖ dplyr::failwith()  masks plyr::failwith()
+✖ dplyr::filter()    masks stats::filter()
+✖ dplyr::id()        masks plyr::id()
+✖ dplyr::lag()       masks stats::lag()
+✖ dplyr::mutate()    masks plyr::mutate()
+✖ dplyr::rename()    masks plyr::rename()
+✖ dplyr::summarise() masks plyr::summarise()
+✖ dplyr::summarize() masks plyr::summarize()
+
+Attaching package: ‘ggpubr’
+
+The following object is masked from ‘package:plyr’:
+
+    mutate
+
+Welcome! Want to learn more? See two factoextra-related books at https://goo.gl/ve3WBa
+Rows: 12226 Columns: 103
+── Column specification ────────────────────────────────────────────────────────
+Delimiter: ","
+chr   (3): X1, X2, X3
+dbl (100): X4, X5, X6, X7, X8, X9, X10, X11, X12, X13, X14, X15, X16, X17, X...
+
+ℹ Use `spec()` to retrieve the full column specification for this data.
+ℹ Specify the column types or set `show_col_types = FALSE` to quiet this message.
+Rows: 467263 Columns: 103
+── Column specification ────────────────────────────────────────────────────────
+Delimiter: ","
+chr   (3): X1, X2, X3
+dbl (100): X4, X5, X6, X7, X8, X9, X10, X11, X12, X13, X14, X15, X16, X17, X...
+
+ℹ Use `spec()` to retrieve the full column specification for this data.
+ℹ Specify the column types or set `show_col_types = FALSE` to quiet this message.
+Rows: 100 Columns: 6
+── Column specification ────────────────────────────────────────────────────────
+Delimiter: "\t"
+dbl (6): X1, X2, X3, X4, X5, X6
+
+ℹ Use `spec()` to retrieve the full column specification for this data.
+ℹ Specify the column types or set `show_col_types = FALSE` to quiet this message.
+Rows: 100 Columns: 3
+── Column specification ────────────────────────────────────────────────────────
+Delimiter: "\t"
+chr (1): Strain
+dbl (2): slope, pc1
+
+ℹ Use `spec()` to retrieve the full column specification for this data.
+ℹ Specify the column types or set `show_col_types = FALSE` to quiet this message.
+Rows: 100 Columns: 101
+── Column specification ────────────────────────────────────────────────────────
+Delimiter: "\t"
+dbl (100): X1, X2, X3, X4, X5, X6, X7, X8, X9, X10, X11, X12, X13, X14, X15,...
+lgl   (1): X101
+
+ℹ Use `spec()` to retrieve the full column specification for this data.
+ℹ Specify the column types or set `show_col_types = FALSE` to quiet this message.
+Rows: 100 Columns: 100
+── Column specification ────────────────────────────────────────────────────────
+Delimiter: "\t"
+dbl (100): X1, X2, X3, X4, X5, X6, X7, X8, X9, X10, X11, X12, X13, X14, X15,...
+
+ℹ Use `spec()` to retrieve the full column specification for this data.
+ℹ Specify the column types or set `show_col_types = FALSE` to quiet this message.
+Error in solve.default(Q) : 
+  Lapack routine dgesv: system is exactly singular: U[13,13] = 0
+Calls: MphEM -> calc_qi -> solve -> solve.default
+Execution halted
